@@ -6,12 +6,13 @@ and produce a structured hypothesis -- probable cause, confidence score,
 and the specific deploy it suspects. This is the first real *inference*
 step in the pipeline; everything before this was retrieval.
 
-Design note: if ANTHROPIC_API_KEY isn't set, this falls back to a
-rule-based heuristic (closest deploy to the alert time = suspect) so the
-graph stays runnable end-to-end without requiring API billing to be set
-up first. This is a deliberate dependency-injection pattern -- swap
-`_call_llm` for the real thing whenever you're ready, nothing else
-in the pipeline needs to change.
+Design note: by default this runs a LOCAL open-source model through
+Ollama (set OLLAMA_MODEL to pick e.g. qwen2.5, llama3.2:3b, mistral). No
+proprietary APIs are used anywhere. If Ollama isn't installed/running,
+it falls back to a rule-based heuristic (closest deploy to the alert
+time = suspect) so the graph stays runnable end-to-end without any
+setup. Swap the provider by replacing `_call_llm` -- nothing else in
+the pipeline needs to change.
 """
 
 from __future__ import annotations
@@ -65,18 +66,21 @@ RECENT DEPLOYS:
 """
 
 
-def _call_llm(system: str, user: str) -> dict:
-    """Real path -- requires ANTHROPIC_API_KEY. Returns parsed JSON dict."""
-    import anthropic
+def _call_llm(system: str, user: str, model: str) -> dict:
+    """Real path -- requires a running Ollama server with `model` pulled.
+    Returns parsed JSON dict. Raises if Ollama isn't available."""
+    import ollama
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        format="json",
+        options={"temperature": 0},
     )
-    text = response.content[0].text.strip()
+    text = response["message"]["content"].strip()
     # strip markdown code fences if the model adds them despite instructions
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     return json.loads(text)
@@ -84,10 +88,9 @@ def _call_llm(system: str, user: str) -> dict:
 
 def _mock_llm(incident: Incident, deploys: list[DeployEvent]) -> dict:
     """
-    Fallback path -- no API key needed. Simple heuristic: the deploy
+    Fallback path -- no Ollama server needed. Simple heuristic: the deploy
     closest in time before the alert is the suspect. This is clearly
-    labeled as a mock so nobody mistakes it for real reasoning -- swap
-    to _call_llm as soon as ANTHROPIC_API_KEY is set.
+    labeled as a mock so nobody mistakes it for real reasoning.
     """
     alert_time = incident.alert.triggered_at
     prior_deploys = [d for d in deploys if d.deployed_at < alert_time]
@@ -102,7 +105,7 @@ def _mock_llm(incident: Incident, deploys: list[DeployEvent]) -> dict:
         "confidence": round(confidence, 2),
         "suspect_commit_sha": suspect.commit_sha if suspect else None,
         "reasoning": (
-            f"[MOCK MODE - no ANTHROPIC_API_KEY set] Deploy {suspect.commit_sha} landed "
+            f"[MOCK MODE - Ollama unavailable] Deploy {suspect.commit_sha} landed "
             f"{minutes_before:.0f} minutes before the alert fired, and error logs began "
             "shortly after. Closest-deploy-in-time heuristic used instead of LLM reasoning."
             if suspect else "[MOCK MODE] No prior deploy found near the alert window."
@@ -113,11 +116,15 @@ def _mock_llm(incident: Incident, deploys: list[DeployEvent]) -> dict:
 def run_root_cause(incident: Incident, scenario_key: str) -> Incident:
     """Entry point for stage 3."""
     deploys = get_deploy_history(scenario_key)
+    model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        user_prompt = _build_user_prompt(incident, deploys)
-        result = _call_llm(SYSTEM_PROMPT, user_prompt)
-    else:
+    user_prompt = _build_user_prompt(incident, deploys)
+    mode = "MOCK"
+    try:
+        result = _call_llm(SYSTEM_PROMPT, user_prompt, model)
+        mode = "LLM"
+    except Exception as exc:
+        print(f"[root_cause] Ollama unavailable ({exc}) -- falling back to mock heuristic")
         result = _mock_llm(incident, deploys)
 
     suspect_deploy = None
@@ -134,7 +141,7 @@ def run_root_cause(incident: Incident, scenario_key: str) -> Incident:
     )
     incident.status = IncidentStatus.ROOT_CAUSE_FOUND
 
-    mode = "LLM" if os.environ.get("ANTHROPIC_API_KEY") else "MOCK"
+    mode = "LLM" if mode == "LLM" else "MOCK"
     print(f"[root_cause:{mode}] incident {incident.id} | "
           f"cause='{incident.hypothesis.probable_cause}' "
           f"confidence={incident.hypothesis.confidence} "

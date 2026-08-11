@@ -12,7 +12,6 @@ code before interrupt() in the same node re-executes. Keeping "build
 the proposal" and "wait for a human" as two separate nodes avoids ever
 double-running side effects.
 """
-
 from __future__ import annotations
 
 from datetime import datetime
