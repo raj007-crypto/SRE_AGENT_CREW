@@ -1,21 +1,28 @@
 """
 Wires the agents together into a LangGraph state graph.
 
-Day 1-2: Detector -> Investigator
-Day 3:   -> RootCause
-Day 4 (this version): -> RemediatorPropose -> Notify -> ApprovalGate -> RemediatorExecute
-Day 5 will add: -> Scribe
+Pipeline (all stages wired end-to-end):
+    Detector -> Investigator -> RootCause -> RemediatorPropose -> Notify
+    -> ApprovalGate (interrupt) -> RemediatorExecute -> Scribe
+
+    Day 1-2: Detector -> Investigator
+    Day 3:   -> RootCause
+    Day 4:   -> RemediatorPropose -> Notify -> ApprovalGate -> RemediatorExecute
+    Day 5:   -> Scribe
+    Day 6:   retries (utils/retry.py), --chaos mode, LangSmith tracing, and a
+             top-level failure handler in main.py that records FAILED incidents.
 
 Each node takes the shared PipelineState, does its work, and returns
 the fields it updated. LangGraph merges the returned dict into state.
 
-Day 4 note: the approval gate needs a checkpointer -- without one,
-LangGraph has nowhere to persist state while the graph is paused
-waiting for a human to respond, and `interrupt()` would fail. MemorySaver
-is fine for the CLI demo (everything happens in one process). In
-production, swap it for a persistent checkpointer (Postgres/Sqlite)
-since a real Slack approval might come minutes after this process
-has restarted.
+The approval gate needs a checkpointer -- without one, LangGraph has nowhere
+to persist state while the graph is paused waiting for a human to respond,
+and `interrupt()` would fail. MemorySaver is fine for the CLI demo (everything
+happens in one process). In production, swap it for a persistent checkpointer
+(Postgres/Sqlite) since a real Slack approval might come minutes after this
+process has restarted. Keep the custom incident_schema types registered on
+the serializer (see get_checkpointer) or checkpoint deserialization will
+silently fall back to raw dicts.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from agents.approval_gate import notify_human, wait_for_approval
@@ -32,7 +40,43 @@ from agents.remediator import run_remediator_execute, run_remediator_propose
 from agents.root_cause import run_root_cause
 from agents.scribe import run_scribe
 from data.fake_data_store import build_alert
-from incident_schema import Incident
+from incident_schema import (
+    Alert,
+    ApprovalDecision,
+    DeployEvent,
+    Evidence,
+    Hypothesis,
+    Incident,
+    IncidentStatus,
+    LogEntry,
+    MetricPoint,
+    Postmortem,
+    RemediationProposal,
+    RemediationResult,
+    Severity,
+    TraceSpan,
+)
+
+# Custom types stored in pipeline state. The checkpoint serializer must be
+# told about them explicitly or msgpack deserialization warns (and will be
+# blocked in a future LangGraph version). Registering them now keeps a future
+# swap to a persistent checkpointer from silently breaking.
+_CHECKPOINT_SERDE_TYPES = (
+    Alert,
+    ApprovalDecision,
+    DeployEvent,
+    Evidence,
+    Hypothesis,
+    Incident,
+    IncidentStatus,
+    LogEntry,
+    MetricPoint,
+    Postmortem,
+    RemediationProposal,
+    RemediationResult,
+    Severity,
+    TraceSpan,
+)
 
 
 class PipelineState(TypedDict):
@@ -85,7 +129,8 @@ def scribe_node(state: PipelineState) -> dict:
 
 
 def get_checkpointer() -> MemorySaver:
-    return MemorySaver()
+    serde = JsonPlusSerializer(allowed_msgpack_modules=_CHECKPOINT_SERDE_TYPES)
+    return MemorySaver(serde=serde)
 
 
 def build_graph(checkpointer=None):

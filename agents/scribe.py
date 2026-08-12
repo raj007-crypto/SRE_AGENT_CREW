@@ -6,8 +6,8 @@ postmortem document. This is the artifact stage -- every prior agent
 produced structured data for the *next* agent to consume; this is the
 first output meant for a *human* to read.
 
-Same mock/real split as root_cause.py: with ANTHROPIC_API_KEY set, an
-LLM writes the narrative sections. Without it, a template fills in the
+Same mock/real split as root_cause.py: with a local Ollama server running,
+an LLM writes the narrative sections. Without it, a template fills in the
 same structure from the raw incident data. Either way the output is a
 complete, saveable Markdown file -- the mock version is intentionally
 still genuinely useful, not a placeholder.
@@ -17,9 +17,17 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from incident_schema import Incident, IncidentStatus, Postmortem
+
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(*_a, **_kw):
+        def _decorator(fn):
+            return fn
+        return _decorator
 
 SYSTEM_PROMPT = """You are an SRE writing a postmortem document. You will be
 given the full structured record of an incident: the alert, evidence
@@ -46,18 +54,20 @@ def _build_user_prompt(incident: Incident) -> str:
 """
 
 
-def _call_llm(system: str, user: str) -> str:
-    """Real path -- requires ANTHROPIC_API_KEY."""
-    import anthropic
+@traceable(name="scribe_llm_call", run_type="llm")
+def _call_llm(system: str, user: str, model: str) -> str:
+    """Real path -- requires a running Ollama server with `model` pulled."""
+    import ollama
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        options={"temperature": 0, "num_predict": 1200},
     )
-    return response.content[0].text.strip()
+    return response["message"]["content"].strip()
 
 
 def _template_postmortem(incident: Incident) -> str:
@@ -130,8 +140,8 @@ def _template_postmortem(incident: Incident) -> str:
         "of issue before it reaches 100% of traffic.",
         "- Review whether an earlier, less severe alert threshold could have caught this sooner.",
         "",
-        "*[This postmortem was generated in template mode -- no ANTHROPIC_API_KEY set. "
-        "Set it for a fuller LLM-written narrative.]*",
+        "*[This postmortem was generated in template mode -- no Ollama LLM available. "
+        "Install/start Ollama for a fuller LLM-written narrative.]*",
     ]
 
     return "\n".join(lines)
@@ -139,19 +149,21 @@ def _template_postmortem(incident: Incident) -> str:
 
 def run_scribe(incident: Incident) -> Incident:
     """Entry point for stage 5."""
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        markdown = _call_llm(SYSTEM_PROMPT, _build_user_prompt(incident))
+    model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+    mode = "TEMPLATE"
+    try:
+        markdown = _call_llm(SYSTEM_PROMPT, _build_user_prompt(incident), model)
         mode = "LLM"
-    else:
+    except Exception as e:
+        print(f"[scribe] Ollama unavailable ({e}), falling back to template mode")
         markdown = _template_postmortem(incident)
-        mode = "TEMPLATE"
 
     title = f"Postmortem: {incident.alert.alert_type.replace('_', ' ').title()} on {incident.alert.service}"
 
     incident.postmortem = Postmortem(
         title=title,
         markdown=markdown,
-        generated_at=datetime.utcnow(),
+        generated_at=datetime.now(timezone.utc),
     )
     incident.status = IncidentStatus.DOCUMENTED
 

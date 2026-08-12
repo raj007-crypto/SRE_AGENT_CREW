@@ -13,14 +13,29 @@ are what the Investigator agent calls, so nothing upstream needs to change.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from incident_schema import Alert, DeployEvent, LogEntry, MetricPoint, TraceSpan
+from utils.retry import TransientAPIError
 
 random.seed(7)  # deterministic demo data
 
+# When True, each query function fails with a TransientAPIError on its
+# first call (per process) to simulate a flaky real observability API.
+# Toggled by `python main.py --chaos` so you can actually see the retry
+# logic in agents/investigator.py do something, instead of it being
+# dead code that only matters "in theory".
+CHAOS_MODE = False
+_chaos_fired: set[str] = set()
+
+
+def _maybe_fail(source: str) -> None:
+    if CHAOS_MODE and source not in _chaos_fired:
+        _chaos_fired.add(source)
+        raise TransientAPIError(f"simulated transient failure calling {source} (chaos mode)")
+
 SERVICE = "checkout-api"
-#bad deploy means that a deployment was bad or which caused the error
+
 SCENARIOS = {
     "bad_deploy": {
         "description": "A bad deploy introduces a null-pointer bug in payment validation.",
@@ -32,11 +47,10 @@ SCENARIOS = {
             commit_sha="a1b2c3d",
             author="jsmith",
             message="Refactor payment validation logic",
-            deployed_at=datetime.utcnow() - timedelta(minutes=12),
+            deployed_at=datetime.now(timezone.utc) - timedelta(minutes=12),
         ),
         "log_message": "NullPointerException in PaymentValidator.validate() at line 88",
     },
-    
     "memory_leak": {
         "description": "A recent change holds references in a cache that's never evicted.",
         "alert_type": "latency_spike",
@@ -47,7 +61,7 @@ SCENARIOS = {
             commit_sha="e4f5g6h",
             author="rpatel",
             message="Add response caching layer for product lookups",
-            deployed_at=datetime.utcnow() - timedelta(hours=3),
+            deployed_at=datetime.now(timezone.utc) - timedelta(hours=3),
         ),
         "log_message": "GC pause exceeded 2000ms, heap usage at 94%",
     },
@@ -61,13 +75,13 @@ SCENARIOS = {
             commit_sha="i7j8k9l",
             author="tchen",
             message="Tune connection pool settings for cost savings",
-            deployed_at=datetime.utcnow() - timedelta(minutes=25),
+            deployed_at=datetime.now(timezone.utc) - timedelta(minutes=25),
         ),
         "log_message": "TimeoutError: could not acquire connection from pool (max=5)",
     },
 }
 
-#builds an alert about what has happened
+
 def build_alert(scenario_key: str) -> Alert:
     s = SCENARIOS[scenario_key]
     return Alert(
@@ -76,18 +90,27 @@ def build_alert(scenario_key: str) -> Alert:
         metric_name=s["metric_name"],
         threshold_breached=s["threshold_breached"],
         current_value=s["current_value"],
-        triggered_at=datetime.utcnow(),
+        triggered_at=datetime.now(timezone.utc),
     )
 
-#generates 6 fake querry logs for testing
+
 def query_logs(scenario_key: str, minutes: int = 30) -> list[LogEntry]:
+    _maybe_fail("logs_api")
     s = SCENARIOS[scenario_key]
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
+    bad_deploy = s.get("bad_commit")
     logs = []
     for i in range(6):
+        if i % 2 == 0 and bad_deploy is not None:
+            # ERROR logs are a *consequence* of the bad deploy -- never
+            # timestamp them before the commit that caused them.
+            elapsed = (now - bad_deploy.deployed_at).total_seconds()
+            ts = bad_deploy.deployed_at + timedelta(seconds=random.uniform(1, max(2, elapsed)))
+        else:
+            ts = now - timedelta(minutes=random.randint(0, minutes))
         logs.append(
             LogEntry(
-                timestamp=now - timedelta(minutes=random.randint(0, minutes)),
+                timestamp=ts,
                 level="ERROR" if i % 2 == 0 else "WARN",
                 service=SERVICE,
                 message=s["log_message"] if i % 2 == 0 else "Elevated response time observed",
@@ -97,11 +120,13 @@ def query_logs(scenario_key: str, minutes: int = 30) -> list[LogEntry]:
 
 
 def query_metrics(scenario_key: str, minutes: int = 30) -> list[MetricPoint]:
+    _maybe_fail("metrics_api")
     s = SCENARIOS[scenario_key]
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     points = []
-    for i in range(minutes, 0, -5):
-        # ramp up toward the current breached value
+    for i in range(minutes, -1, -5):
+        # ramp up toward the current breached value; the i=0 step lands
+        # exactly on current_value so the trend matches what the alert fired on
         progress = (minutes - i) / minutes
         value = s["threshold_breached"] + progress * (s["current_value"] - s["threshold_breached"])
         points.append(
@@ -115,7 +140,8 @@ def query_metrics(scenario_key: str, minutes: int = 30) -> list[MetricPoint]:
 
 
 def query_traces(scenario_key: str, minutes: int = 30) -> list[TraceSpan]:
-    now = datetime.utcnow()
+    _maybe_fail("traces_api")
+    now = datetime.now(timezone.utc)
     spans = []
     for i in range(5):
         spans.append(
@@ -136,19 +162,6 @@ def get_deploy_history(scenario_key: str) -> list[DeployEvent]:
         commit_sha="z9y8x7w",
         author="mkumar",
         message="Update logging format",
-        deployed_at=datetime.utcnow() - timedelta(days=1),
+        deployed_at=datetime.now(timezone.utc) - timedelta(days=1),
     )
     return [s["bad_commit"], older]
-
-#This module is a fake data generator that mimics calling real
-# observability tools. Every function signature (build_alert,
-# query_logs, query_metrics, query_traces, get_deploy_history)
-# is designed to look like what a real integration would expose,
-# so that later, someone can replace the implementation 
-#(swap fake generation for real Datadog/Prometheus/Jaeger/GitHub
-# API calls) without touching the Investigator agent that 
-#consumes these functions. It's a classic
-# "fake it till you make it" backend used to develop and test 
-#an end-to-end pipeline before the real integrations exist —
-# and the random.seed(7) ensures the fake data is reproducible for
-# testing/demo purposes.

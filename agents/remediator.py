@@ -14,7 +14,7 @@ double-running side effects.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from incident_schema import (
     ApprovalDecision,
@@ -70,14 +70,14 @@ def run_remediator_execute(incident: Incident, approval: ApprovalDecision) -> In
             executed=False,
             output=f"Action denied by {approval.approved_by or 'operator'}: "
                    f"{approval.note or 'no reason given'}",
-            executed_at=datetime.utcnow(),
+            executed_at=datetime.now(timezone.utc),
         )
         print(f"[remediator] incident {incident.id} | DENIED by {approval.approved_by}")
         return incident
 
     output = f"Executed '{incident.proposal.action}' on '{incident.proposal.target}' (simulated)"
     incident.remediation = RemediationResult(
-        executed=True, output=output, executed_at=datetime.utcnow()
+        executed=True, output=output, executed_at=datetime.now(timezone.utc)
     )
     incident.status = IncidentStatus.REMEDIATED
 

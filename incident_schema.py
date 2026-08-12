@@ -9,12 +9,12 @@ resume later.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Severity(str, Enum):
@@ -37,7 +37,7 @@ class IncidentStatus(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 output:
+# Stage 1 output: Detector
 # ---------------------------------------------------------------------------
 
 class Alert(BaseModel):
@@ -84,16 +84,15 @@ class Evidence(BaseModel):
 # ---------------------------------------------------------------------------
 # Stage 3 output: Root-cause agent
 # ---------------------------------------------------------------------------
-# SO the class down tells us about the recent deploy that has
-#been done and if there is any error from that deployment or not
-class DeployEvent(BaseModel): 
-    commit_sha: str #stores the git id of the last commit
+
+class DeployEvent(BaseModel):
+    commit_sha: str
     author: str
     message: str
     deployed_at: datetime
 
 
-class Hypothesis(BaseModel):#stores the probable cause of the error
+class Hypothesis(BaseModel):
     probable_cause: str
     confidence: float               # 0.0 - 1.0
     suspect_deploy: Optional[DeployEvent] = None
@@ -104,20 +103,19 @@ class Hypothesis(BaseModel):#stores the probable cause of the error
 # Stage 4 output: Remediator + approval gate
 # ---------------------------------------------------------------------------
 
-class RemediationProposal(BaseModel):#The proposed fix: what action to take, what it targets, and why.
+class RemediationProposal(BaseModel):
     action: str                     # e.g. "rollback"
     target: str                     # e.g. commit sha or service name
     justification: str
 
 
-class ApprovalDecision(BaseModel):#this tells us the human decision
-    #who approved the decision and time and everything
+class ApprovalDecision(BaseModel):
     approved: bool
     approved_by: Optional[str] = None
     decided_at: Optional[datetime] = None
     note: Optional[str] = None
 
-#what actually happened when the action was carried out
+
 class RemediationResult(BaseModel):
     executed: bool
     output: str
@@ -127,7 +125,7 @@ class RemediationResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Stage 5 output: Scribe
 # ---------------------------------------------------------------------------
-#the final postmortem
+
 class Postmortem(BaseModel):
     title: str
     markdown: str
@@ -141,7 +139,7 @@ class Postmortem(BaseModel):
 class Incident(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4())[:8])
     status: IncidentStatus = IncidentStatus.DETECTED
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     alert: Alert
     evidence: Optional[Evidence] = None
@@ -150,6 +148,6 @@ class Incident(BaseModel):
     approval: Optional[ApprovalDecision] = None
     remediation: Optional[RemediationResult] = None
     postmortem: Optional[Postmortem] = None
+    error: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)

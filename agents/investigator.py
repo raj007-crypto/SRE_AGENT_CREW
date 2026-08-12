@@ -17,20 +17,24 @@ import time
 
 from data.fake_data_store import query_logs, query_metrics, query_traces
 from incident_schema import Evidence, Incident, IncidentStatus
+from utils.retry import with_retries
 
 ARTIFICIAL_LATENCY_SECONDS = 1.0  # simulates a real API round-trip
 
 
+@with_retries()
 async def _query_logs_async(scenario_key: str) -> list:
     await asyncio.sleep(ARTIFICIAL_LATENCY_SECONDS)
     return query_logs(scenario_key)
 
 
+@with_retries()
 async def _query_metrics_async(scenario_key: str) -> list:
     await asyncio.sleep(ARTIFICIAL_LATENCY_SECONDS)
     return query_metrics(scenario_key)
 
 
+@with_retries()
 async def _query_traces_async(scenario_key: str) -> list:
     await asyncio.sleep(ARTIFICIAL_LATENCY_SECONDS)
     return query_traces(scenario_key)

@@ -6,23 +6,31 @@ and produce a structured hypothesis -- probable cause, confidence score,
 and the specific deploy it suspects. This is the first real *inference*
 step in the pipeline; everything before this was retrieval.
 
-Design note: by default this runs a LOCAL open-source model through
-Ollama (set OLLAMA_MODEL to pick e.g. qwen2.5, llama3.2:3b, mistral). No
-proprietary APIs are used anywhere. If Ollama isn't installed/running,
-it falls back to a rule-based heuristic (closest deploy to the alert
-time = suspect) so the graph stays runnable end-to-end without any
-setup. Swap the provider by replacing `_call_llm` -- nothing else in
-the pipeline needs to change.
+Design note: this runs a LOCAL open-source model through Ollama (set
+OLLAMA_MODEL to pick e.g. qwen2.5, llama3.2:3b, mistral). No proprietary
+APIs are used anywhere. If Ollama isn't installed/running, it falls back
+to a rule-based heuristic (closest deploy to the alert time = suspect) so
+the graph stays runnable end-to-end without any setup. This is a
+deliberate dependency-injection pattern -- swap `_call_llm` for another
+provider whenever you're ready, nothing else in the pipeline needs to
+change.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
 
 from data.fake_data_store import get_deploy_history
 from incident_schema import DeployEvent, Hypothesis, Incident, IncidentStatus
+
+try:
+    from langsmith import traceable
+except ImportError:  # tracing is optional -- pipeline works fine without it
+    def traceable(*_a, **_kw):
+        def _decorator(fn):
+            return fn
+        return _decorator
 
 SYSTEM_PROMPT = """You are an SRE root-cause analysis agent. You will be given:
 1. An alert (what triggered the incident)
@@ -66,9 +74,8 @@ RECENT DEPLOYS:
 """
 
 
-def _call_llm(system: str, user: str, model: str) -> dict:
-    """Real path -- requires a running Ollama server with `model` pulled.
-    Returns parsed JSON dict. Raises if Ollama isn't available."""
+@traceable(name="root_cause_llm_call", run_type="llm")
+def _call_llm_once(system: str, user: str, model: str) -> str:
     import ollama
 
     response = ollama.chat(
@@ -81,16 +88,44 @@ def _call_llm(system: str, user: str, model: str) -> dict:
         options={"temperature": 0},
     )
     text = response["message"]["content"].strip()
-    # strip markdown code fences if the model adds them despite instructions
-    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(text)
+    return text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
+def _call_llm(system: str, user: str, model: str, max_attempts: int = 2) -> dict:
+    """
+    Real path -- requires a running Ollama server with `model` pulled.
+    Returns parsed JSON dict.
+
+    LLMs occasionally don't follow the "respond with ONLY JSON" instruction
+    perfectly. Rather than crash the whole pipeline on a malformed response,
+    retry once with an explicit correction appended to the prompt -- cheaper
+    and more reliable than a generic exponential-backoff retry here, since
+    the failure mode is "wrong format", not "server unavailable".
+    """
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        prompt = user if attempt == 1 else (
+            user + "\n\nYour previous response was not valid JSON. "
+            "Respond with ONLY the JSON object, no markdown, no commentary."
+        )
+        text = _call_llm_once(system, prompt, model)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            last_error = e
+            print(f"[root_cause] LLM returned malformed JSON on attempt {attempt}, "
+                  f"{'retrying' if attempt < max_attempts else 'giving up'}")
+
+    raise ValueError(f"root_cause LLM call failed to return valid JSON after "
+                      f"{max_attempts} attempts: {last_error}")
 
 
 def _mock_llm(incident: Incident, deploys: list[DeployEvent]) -> dict:
     """
     Fallback path -- no Ollama server needed. Simple heuristic: the deploy
     closest in time before the alert is the suspect. This is clearly
-    labeled as a mock so nobody mistakes it for real reasoning.
+    labeled as a mock so nobody mistakes it for real reasoning -- swap
+    to _call_llm once a local Ollama server is available.
     """
     alert_time = incident.alert.triggered_at
     prior_deploys = [d for d in deploys if d.deployed_at < alert_time]
@@ -105,7 +140,7 @@ def _mock_llm(incident: Incident, deploys: list[DeployEvent]) -> dict:
         "confidence": round(confidence, 2),
         "suspect_commit_sha": suspect.commit_sha if suspect else None,
         "reasoning": (
-            f"[MOCK MODE - Ollama unavailable] Deploy {suspect.commit_sha} landed "
+            f"[MOCK MODE - no Ollama server available] Deploy {suspect.commit_sha} landed "
             f"{minutes_before:.0f} minutes before the alert fired, and error logs began "
             "shortly after. Closest-deploy-in-time heuristic used instead of LLM reasoning."
             if suspect else "[MOCK MODE] No prior deploy found near the alert window."
@@ -117,14 +152,16 @@ def run_root_cause(incident: Incident, scenario_key: str) -> Incident:
     """Entry point for stage 3."""
     deploys = get_deploy_history(scenario_key)
     model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
-
-    user_prompt = _build_user_prompt(incident, deploys)
     mode = "MOCK"
+
     try:
+        user_prompt = _build_user_prompt(incident, deploys)
         result = _call_llm(SYSTEM_PROMPT, user_prompt, model)
         mode = "LLM"
-    except Exception as exc:
-        print(f"[root_cause] Ollama unavailable ({exc}) -- falling back to mock heuristic")
+    except Exception as e:
+        # Don't let an LLM outage take down the whole incident response
+        # pipeline -- degrade to the heuristic instead of failing closed.
+        print(f"[root_cause] Ollama unavailable ({e}), falling back to mock mode")
         result = _mock_llm(incident, deploys)
 
     suspect_deploy = None
@@ -141,7 +178,6 @@ def run_root_cause(incident: Incident, scenario_key: str) -> Incident:
     )
     incident.status = IncidentStatus.ROOT_CAUSE_FOUND
 
-    mode = "LLM" if mode == "LLM" else "MOCK"
     print(f"[root_cause:{mode}] incident {incident.id} | "
           f"cause='{incident.hypothesis.probable_cause}' "
           f"confidence={incident.hypothesis.confidence} "
