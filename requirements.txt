@@ -10,3 +10,7 @@ fastapi>=0.110
 uvicorn>=0.27
 pytest>=8.0
 pytest-asyncio>=0.23
+
+# Day 1: fake payments service + traffic generator
+httpx>=0.27
+prometheus-client>=0.20
